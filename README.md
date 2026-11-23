@@ -26,6 +26,39 @@ move as much as possible out of the emulator, step by step:
 In short: the game logic already runs as native code; the remaining emulator pieces are the hardware and
 operating-system layers around it, and replacing them is the main work ahead. Contributions are welcome.
 
+### Roadmap to 100% native
+
+**Phase 0 — Foundation** ✅
+- [x] ARM11 → C static recompiler, run at install time from the user's own dump
+- [x] Native code for ~98–99% of executed game code (interpreter fallback for the rest)
+- [x] All four titles supported (Sun, Moon, Ultra Sun, Ultra Moon)
+- [x] Own frontend: menu, launcher, installer, controllers, frame interpolation, photo mode
+
+**Phase 1 — CPU: 100% native game code**
+- [ ] Translate the remaining functions that still fall back to the interpreter (indirect jumps, rare instructions)
+- [ ] Recompile the code modules the game loads at runtime (CRO) ahead of time
+- [ ] Automatic checker that proves no game code runs outside the native library
+- [ ] Native 60 FPS game logic in the overworld (not just interpolated frames)
+
+**Phase 2 — Operating system: native services**
+- [ ] Files and saves read/written directly on the PC (no virtual SD / NAND)
+- [ ] Input, clock and applet services (HID, time, APT) as thin native code
+- [ ] Game threads on native threads instead of an emulated kernel scheduler
+- [ ] Game memory mapped directly in the PC's address space
+
+**Phase 3 — Audio**
+- [ ] Replace DSP emulation with a native mixer playing the game's sound data
+
+**Phase 4 — Graphics**
+- [ ] Translate the game's PICA200 command lists straight to Vulkan
+- [ ] Compile all game shaders at install time (no first-time stutter or glitch)
+- [ ] Remove the emulated GPU / rasterizer
+
+**Phase 5 — Standalone**
+- [ ] Drop the Azahar core entirely: one native executable + the recompiled game library
+- [ ] Linux build
+- [ ] Mod support on top of the native code (textures, models, scripts)
+
 ## Beyond the original hardware
 
 We don't just want to match the 3DS — we plan to add **many features the original hardware never supported**.
