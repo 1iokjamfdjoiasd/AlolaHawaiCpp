@@ -1,0 +1,19 @@
+# never commit anything game-derived or built
+*.3ds
+*.cci
+*.cxi
+*.cia
+*.dll
+*.exe
+*.o
+*.a
+*.cst
+*.sav
+build/
+bin/
+estudo/
+extraido/
+compilacao/
+__pycache__/
+*.pyc
+*.bak

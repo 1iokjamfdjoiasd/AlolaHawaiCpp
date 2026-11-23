@@ -1,0 +1,1871 @@
+diff --git a/src/common/porte_counters.h b/src/common/porte_counters.h
+new file mode 100644
+index 0000000..158844b
+--- /dev/null
++++ b/src/common/porte_counters.h
+@@ -0,0 +1,10 @@
++#pragma once
++// PORTE (22/11): counters read by the frontend's advanced log (Sistema > Log avançado)
++#include <atomic>
++namespace Common {
++inline std::atomic<unsigned long long> g_porte_pipe_builds{0}, g_porte_pipe_us{0};
++inline std::atomic<unsigned long long> g_porte_surf_new{0}, g_porte_surf_rec{0}, g_porte_surf_rec_big{0};
++// (22/11) draws skipped because their shader was still compiling (async): a redraw of the interpolation that skipped one
++// is not shown (the Charizard flight: sky / fade missing in the in-between pictures)
++inline std::atomic<unsigned long long> g_porte_async_skips{0};
++} // namespace Common
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index 204630a..dbd0cb8 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -15,6 +15,18 @@
+ 
+ namespace Common {
+ 
++// PORTE (Ultra Moon, interpolação): goes up whenever any slot is destroyed or replaced (surfaces, samplers,
++// framebuffers...). Something noted by slot id stays valid only while this has not changed (creating a
++// new slot never invalidates an existing id).
++inline u64 g_porte_slot_gen = 0;
++// PORTE: goes up when the rasterizer cache recycles a sentenced surface for a new use
++inline u64 g_porte_recycle_gen = 0;
++// PORTE: the resource tick the current "gravar e repetir" recording began at: a sentenced surface whose tick is older
++// was unregistered before the recording, so no recorded command names it and recycling it is harmless
++inline u64 g_porte_cap_since = ~0ull;
++// PORTE: erases of fill surfaces (CPU-only descriptions, no GPU image): not a danger for recorded commands
++inline u64 g_porte_fill_erases = 0;
++
+ struct SlotId {
+     static constexpr u32 INVALID_INDEX = std::numeric_limits<u32>::max();
+ 
+@@ -58,6 +70,7 @@ public:
+         const u32 index = FreeValueIndex();
+         new (&values[index].object) T(std::forward<Args>(args)...);
+         SetStorageBit(index);
++        ++porte_incarnation[index];
+ 
+         return SlotId{index};
+     }
+@@ -71,11 +84,16 @@ public:
+         existing_value.~T();
+         new (&values[existing_id.index].object) T(std::forward<Args>(args)...);
+         SetStorageBit(index);
++        ++g_porte_slot_gen;
++        ++porte_incarnation[index];
++        ++porte_incarnation[existing_id.index];
+ 
+         return SlotId{index};
+     }
+ 
+     void erase(SlotId id) noexcept {
++        ++g_porte_slot_gen;
++        ++porte_incarnation[id.index];
+         values[id.index].object.~T();
+         free_list.push_back(id.index);
+         ResetStorageBit(id.index);
+@@ -85,6 +103,19 @@ public:
+         return values_capacity - free_list.size();
+     }
+ 
++    /// PORTE (interpolação): which object occupies a slot (goes up every time it is filled, replaced or
++    /// emptied); a slot noted with its incarnation is the same live object only while both still match
++    u32 PorteIncarnation(SlotId id) const noexcept {
++        return id && id.index < porte_incarnation.size() ? porte_incarnation[id.index] : 0;
++    }
++    bool PorteAlive(SlotId id, u32 incarnation) const noexcept {
++        if (!id || id.index >= values_capacity || id.index / 64 >= stored_bitset.size()) {
++            return false;
++        }
++        const bool stored = ((stored_bitset[id.index / 64] >> (id.index % 64)) & 1) != 0;
++        return stored && porte_incarnation[id.index] == incarnation;
++    }
++
+ private:
+     struct NonTrivialDummy {
+         NonTrivialDummy() noexcept {}
+@@ -143,6 +174,7 @@ private:
+         }
+ 
+         stored_bitset.resize((new_capacity + 63) / 64);
++        porte_incarnation.resize(new_capacity, 0);
+ 
+         const std::size_t old_free_size = free_list.size();
+         free_list.resize(old_free_size + (new_capacity - values_capacity));
+@@ -159,6 +191,7 @@ private:
+ 
+     std::vector<u64> stored_bitset;
+     std::vector<u32> free_list;
++    std::vector<u32> porte_incarnation;   // PORTE
+ };
+ 
+ } // namespace Common
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index 2c86e56..02743f1 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -188,6 +188,50 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
+         break;
+     }
+ 
++    // (porte) rewind: same conditions as the save / load below
++    if ((porte_rewind_save || porte_rewind_load) && save_state_request_status == SaveStateStatus::NONE &&
++        kernel.get() && !kernel->AreAsyncOperationsPending()) {
++        if (porte_rewind_load) {
++            porte_rewind_load = false;
++            porte_rewind_save = false;
++            try {
++                LoadStateBuffer(std::move(porte_rewind_buf));
++            } catch (const std::exception& e) {
++                LOG_ERROR(Core, "Rewind load failed: {}", e.what());
++                std::fprintf(stderr, "rewind: falha ao carregar (%s)\n", e.what());
++                status_details = e.what();
++                porte_rewind_buf.clear();
++                return ResultStatus::ErrorSavestate;
++            } catch (...) {
++                std::fprintf(stderr, "rewind: falha ao carregar (exceção desconhecida)\n");
++                porte_rewind_buf.clear();
++                return ResultStatus::ErrorSavestate;
++            }
++            porte_rewind_buf.clear();
++        } else {
++            porte_rewind_save = false;
++            try {
++                const auto porte_t0 = std::chrono::steady_clock::now();
++                std::vector<u8> raw = PorteRawState();
++                static const bool porte_log = std::getenv("PORTE_REWIND_LOG") != nullptr;
++                if (porte_log) {
++                    std::fprintf(stderr, "rewind: ponto %.0f MB em %.0f ms\n", raw.size() / 1048576.0,
++                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - porte_t0).count());
++                }
++                if (porte_rewind_sink) {
++                    porte_rewind_sink(std::move(raw));
++                }
++            } catch (const std::exception& e) {
++                LOG_ERROR(Core, "Rewind save failed: {}", e.what());
++                std::fprintf(stderr, "rewind: falha ao salvar (%s)\n", e.what());
++            } catch (...) {
++                std::fprintf(stderr, "rewind: falha ao salvar (exceção desconhecida)\n");
++            }
++        }
++        frame_limiter.WaitOnce();
++        return ResultStatus::Success;
++    }
++
+     if (save_state_request_status == SaveStateStatus::LOADING && kernel.get() &&
+         !kernel->AreAsyncOperationsPending()) {
+         const u32 slot = save_state_slot;
+diff --git a/src/core/core.h b/src/core/core.h
+index 5920595..8cdaaae 100644
+--- a/src/core/core.h
++++ b/src/core/core.h
+@@ -7,6 +7,8 @@
+ #include <atomic>
+ #include <chrono>
+ #include <memory>
++#include <span>
++#include <functional>
+ #include <mutex>
+ #include <string>
+ #include <boost/optional.hpp>
+@@ -78,6 +80,11 @@ class ARM_Interface;
+ class ExclusiveMonitor;
+ class Timing;
+ 
++/// (porte) goes up after every state load (file, buffer, rewind): the kernel, memory and renderer are new objects then -
++/// they may even sit at the same addresses as the old ones, so comparing pointers does not tell (the rewind's fast
++/// loads crashed in the recompiler's direct system calls, which kept the old kernel)
++inline unsigned long long g_porte_load_gen = 0;
++
+ class System {
+ public:
+     /**
+@@ -395,6 +402,17 @@ public:
+ 
+     std::vector<u8> SaveStateBuffer() const;
+ 
++    /// (porte) rewind: a state kept in memory is made / loaded at the same safe point as the save / load signals
++    /// (calling SaveStateBuffer / LoadStateBuffer from outside the loop hung the game). The save hands the RAW
++    /// serialized state (no compression: the frontend compresses it on another thread with PorteFinishState).
++    std::function<void(std::vector<u8>&&)> porte_rewind_sink;
++    bool porte_rewind_save = false;
++    bool porte_rewind_load = false;
++    std::vector<u8> porte_rewind_buf;
++    mutable std::vector<u8> porte_rewind_spare;   // a buffer to write the next raw state into (reused: no fresh 300 MB)
++    std::vector<u8> PorteRawState() const;
++    std::vector<u8> PorteFinishState(std::span<const u8> raw, int level) const;   // header + zstd (any thread)
++
+     bool LoadStateBuffer(std::vector<u8> buffer);
+ 
+     /// Applies any changes to settings to this core instance.
+diff --git a/src/core/frontend/framebuffer_layout.cpp b/src/core/frontend/framebuffer_layout.cpp
+index 3a31142..e1f4196 100644
+--- a/src/core/frontend/framebuffer_layout.cpp
++++ b/src/core/frontend/framebuffer_layout.cpp
+@@ -11,6 +11,13 @@
+ 
+ namespace Layout {
+ 
++// (porte) real 16:9: the game draws a wider view (vk_rasterizer: g_porte_wide_proj) and the top screen is shown
++// 427 wide instead of 400 - every layout below uses this width for it
++float g_porte_top_wide = 1.0f;
++static u32 PorteTopW() {
++    return static_cast<u32>(Core::kScreenTopWidth * g_porte_top_wide + 0.5f);
++}
++
+ static constexpr float TOP_SCREEN_ASPECT_RATIO =
+     static_cast<float>(Core::kScreenTopHeight) / Core::kScreenTopWidth;
+ static constexpr float BOT_SCREEN_ASPECT_RATIO =
+@@ -18,7 +25,7 @@ static constexpr float BOT_SCREEN_ASPECT_RATIO =
+ 
+ u32 FramebufferLayout::GetScalingRatio() const {
+     if (is_rotated) {
+-        return static_cast<u32>(((top_screen.GetWidth() - 1) / Core::kScreenTopWidth) + 1);
++        return static_cast<u32>(((top_screen.GetWidth() - 1) / PorteTopW()) + 1);
+     } else {
+         return static_cast<u32>(((top_screen.GetWidth() - 1) / Core::kScreenTopHeight) + 1);
+     }
+@@ -94,7 +101,7 @@ FramebufferLayout SingleFrameLayout(u32 width, u32 height, bool swapped, bool up
+     FramebufferLayout res{width, height, !swapped, swapped, {}, {}, !upright};
+ 
+     Common::Rectangle<u32> screen_window_area{0, 0, width, height};
+-    Common::Rectangle<u32> top_screen{0, 0, Core::kScreenTopWidth, Core::kScreenTopHeight};
++    Common::Rectangle<u32> top_screen{0, 0, PorteTopW(), Core::kScreenTopHeight};
+     Common::Rectangle<u32> bot_screen{0, 0, Core::kScreenBottomWidth, Core::kScreenBottomHeight};
+ 
+     const float window_aspect_ratio = static_cast<float>(height) / static_cast<float>(width);
+@@ -164,8 +171,8 @@ FramebufferLayout LargeFrameLayout(u32 width, u32 height, bool swapped, bool upr
+     u32 large_height = swapped ? Core::kScreenBottomHeight : Core::kScreenTopHeight;
+     u32 small_height = static_cast<u32>(swapped ? Core::kScreenTopHeight / scale_factor
+                                                 : Core::kScreenBottomHeight / scale_factor);
+-    u32 large_width = swapped ? Core::kScreenBottomWidth : Core::kScreenTopWidth;
+-    u32 small_width = static_cast<u32>(swapped ? Core::kScreenTopWidth / scale_factor
++    u32 large_width = swapped ? Core::kScreenBottomWidth : PorteTopW();
++    u32 small_width = static_cast<u32>(swapped ? PorteTopW() / scale_factor
+                                                : Core::kScreenBottomWidth / scale_factor);
+ 
+     u32 emulation_width;
+@@ -409,7 +416,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+ 
+             break;
+         case Settings::PortraitLayoutOption::PortraitTopFullWidth:
+-            width = Core::kScreenTopWidth * res_scale;
++            width = PorteTopW() * res_scale;
+             // clang-format off
+             height = (static_cast<int>(Core::kScreenTopHeight + Core::kScreenBottomHeight * 1.25) *
+                      res_scale) + gap;
+@@ -419,7 +426,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+                                            Settings::values.upright_screen.GetValue());
+             break;
+         case Settings::PortraitLayoutOption::PortraitOriginal:
+-            width = Core::kScreenTopWidth * res_scale;
++            width = PorteTopW() * res_scale;
+             height = (Core::kScreenTopHeight + Core::kScreenBottomHeight) * res_scale;
+             layout = PortraitOriginalLayout(width, height, Settings::values.swap_screen.GetValue());
+             break;
+@@ -445,7 +452,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+                 width = Core::kScreenBottomWidth * res_scale;
+                 height = Core::kScreenBottomHeight * res_scale;
+             } else {
+-                width = Core::kScreenTopWidth * res_scale;
++                width = PorteTopW() * res_scale;
+                 height = Core::kScreenTopHeight * res_scale;
+             }
+             if (Settings::values.upright_screen.GetValue()) {
+@@ -459,10 +466,10 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+ 
+         case Settings::LayoutOption::LargeScreen: {
+             const bool swapped = Settings::values.swap_screen.GetValue();
+-            const int largeWidth = swapped ? Core::kScreenBottomWidth : Core::kScreenTopWidth;
++            const int largeWidth = swapped ? Core::kScreenBottomWidth : PorteTopW();
+             const int largeHeight = swapped ? Core::kScreenBottomHeight : Core::kScreenTopHeight;
+             const int smallWidth =
+-                static_cast<int>((swapped ? Core::kScreenTopWidth : Core::kScreenBottomWidth) /
++                static_cast<int>((swapped ? PorteTopW() : Core::kScreenBottomWidth) /
+                                  Settings::values.large_screen_proportion.GetValue());
+             const int smallHeight =
+                 static_cast<int>((swapped ? Core::kScreenTopHeight : Core::kScreenBottomHeight) /
+@@ -490,7 +497,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+             break;
+         }
+         case Settings::LayoutOption::SideScreen:
+-            width = (Core::kScreenTopWidth + Core::kScreenBottomWidth) * res_scale + gap;
++            width = (PorteTopW() + Core::kScreenBottomWidth) * res_scale + gap;
+             height = Core::kScreenTopHeight * res_scale;
+ 
+             if (Settings::values.upright_screen.GetValue()) {
+@@ -506,10 +513,10 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+             if (Settings::values.swap_screen.GetValue()) {
+                 width = Core::kScreenBottomWidth;
+             } else {
+-                width = Core::kScreenTopWidth;
++                width = PorteTopW();
+             }
+             // 2.25f comes from HybridScreenLayout's scale_factor value.
+-            width = static_cast<int>((width + (Core::kScreenTopWidth / 2.25f)) * res_scale);
++            width = static_cast<int>((width + (PorteTopW() / 2.25f)) * res_scale);
+ 
+             if (Settings::values.upright_screen.GetValue()) {
+                 std::swap(width, height);
+@@ -520,7 +527,7 @@ FramebufferLayout FrameLayoutFromResolutionScale(u32 res_scale, bool is_secondar
+             break;
+         case Settings::LayoutOption::Default:
+         default:
+-            width = Core::kScreenTopWidth * res_scale;
++            width = PorteTopW() * res_scale;
+             height = (Core::kScreenTopHeight + Core::kScreenBottomHeight) * res_scale + gap;
+ 
+             if (Settings::values.upright_screen.GetValue()) {
+@@ -657,7 +664,7 @@ FramebufferLayout reverseLayout(FramebufferLayout layout) {
+ }
+ 
+ std::pair<unsigned, unsigned> GetMinimumSizeFromPortraitLayout() {
+-    const u32 min_width = Core::kScreenTopWidth;
++    const u32 min_width = PorteTopW();
+     const u32 min_height = Core::kScreenTopHeight + Core::kScreenBottomHeight;
+     return std::make_pair(min_width, min_height);
+ }
+@@ -671,14 +678,14 @@ std::pair<unsigned, unsigned> GetMinimumSizeFromLayout(Settings::LayoutOption la
+ #ifndef ANDROID
+     case Settings::LayoutOption::SeparateWindows:
+ #endif
+-        min_width = Settings::values.swap_screen ? Core::kScreenBottomWidth : Core::kScreenTopWidth;
++        min_width = Settings::values.swap_screen ? Core::kScreenBottomWidth : PorteTopW();
+         min_height = Core::kScreenBottomHeight;
+         break;
+     case Settings::LayoutOption::LargeScreen: {
+         const bool swapped = Settings::values.swap_screen.GetValue();
+-        const int largeWidth = swapped ? Core::kScreenBottomWidth : Core::kScreenTopWidth;
++        const int largeWidth = swapped ? Core::kScreenBottomWidth : PorteTopW();
+         const int largeHeight = swapped ? Core::kScreenBottomHeight : Core::kScreenTopHeight;
+-        int smallWidth = swapped ? Core::kScreenTopWidth : Core::kScreenBottomWidth;
++        int smallWidth = swapped ? PorteTopW() : Core::kScreenBottomWidth;
+         int smallHeight = swapped ? Core::kScreenTopHeight : Core::kScreenBottomHeight;
+         smallWidth =
+             static_cast<int>(smallWidth / Settings::values.large_screen_proportion.GetValue());
+@@ -699,12 +706,12 @@ std::pair<unsigned, unsigned> GetMinimumSizeFromLayout(Settings::LayoutOption la
+         break;
+     }
+     case Settings::LayoutOption::SideScreen:
+-        min_width = Core::kScreenTopWidth + Core::kScreenBottomWidth;
++        min_width = PorteTopW() + Core::kScreenBottomWidth;
+         min_height = Core::kScreenBottomHeight;
+         break;
+     case Settings::LayoutOption::Default:
+     default:
+-        min_width = Core::kScreenTopWidth;
++        min_width = PorteTopW();
+         min_height = Core::kScreenTopHeight + Core::kScreenBottomHeight;
+         break;
+     }
+diff --git a/src/core/frontend/framebuffer_layout.h b/src/core/frontend/framebuffer_layout.h
+index dd1cefe..04fac2f 100644
+--- a/src/core/frontend/framebuffer_layout.h
++++ b/src/core/frontend/framebuffer_layout.h
+@@ -9,6 +9,8 @@
+ 
+ namespace Layout {
+ 
++extern float g_porte_top_wide;   // (porte) 16:9: 427/400, else 1
++
+ /// Orientation of the 3DS displays
+ enum class DisplayOrientation {
+     Landscape,        // Default orientation of the 3DS
+diff --git a/src/core/perf_stats.cpp b/src/core/perf_stats.cpp
+index 9cfca48..71e5bbf 100644
+--- a/src/core/perf_stats.cpp
++++ b/src/core/perf_stats.cpp
+@@ -248,7 +248,10 @@ void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
+     // speed percent or it will clamp too much and prevent this from properly limiting to that
+     // percent. High values means it'll take longer after a slow frame to recover and start limiting
+     const microseconds max_lag_time_us = duration_cast<microseconds>(
+-        std::chrono::duration<double, std::chrono::microseconds::period>(25ms / sleep_scale));
++        std::chrono::duration<double, std::chrono::microseconds::period>(100ms / sleep_scale));
++    // (porte UM, 20/11) 25 ms -> 100 ms: with the interpolation the emulation sometimes waits more than 25 ms for
++    // the GPU in one frame; the excess was thrown away (game at ~96-98% with ~45% of the time idle). Now that
++    // time is caught up from the idle time (up to ~3 game frames)
+     frame_limiting_delta_err += duration_cast<microseconds>(
+         std::chrono::duration<double, std::chrono::microseconds::period>(
+             (current_system_time_us - previous_system_time_us) / sleep_scale));
+diff --git a/src/core/savestate.cpp b/src/core/savestate.cpp
+index 16c3db6..966a9e5 100644
+--- a/src/core/savestate.cpp
++++ b/src/core/savestate.cpp
+@@ -240,6 +240,7 @@ void System::LoadState(u32 slot) {
+     // Deserialize
+     iarchive ia{sstream};
+     ia&* this;
++    ++g_porte_load_gen;   // (porte)
+ }
+ 
+ std::vector<u8> System::SaveStateBuffer() const {
+@@ -278,6 +279,63 @@ std::vector<u8> System::SaveStateBuffer() const {
+     return result;
+ }
+ 
++// (porte) rewind: the serialized state only (the expensive compression is done elsewhere, see PorteFinishState).
++// Written straight into a vector reserved with the last size (an ostringstream grew by copying, then the whole string
++// was copied again: ~380 ms for ~300 MB)
++namespace {
++struct PorteVecBuf : std::streambuf {
++    std::vector<u8>& v;
++    explicit PorteVecBuf(std::vector<u8>& out) : v(out) {}
++    std::streamsize xsputn(const char* s, std::streamsize n) override {
++        v.insert(v.end(), reinterpret_cast<const u8*>(s), reinterpret_cast<const u8*>(s) + n);
++        return n;
++    }
++    int_type overflow(int_type c) override {
++        if (c != traits_type::eof()) {
++            v.push_back(static_cast<u8>(c));
++        }
++        return c;
++    }
++};
++} // namespace
++
++std::vector<u8> System::PorteRawState() const {
++    static std::size_t last_size = 0;
++    std::vector<u8> out = std::move(porte_rewind_spare);   // (the frontend hands back the buffer of an older point)
++    porte_rewind_spare = {};
++    out.clear();
++    const std::size_t want = last_size ? last_size + last_size / 16 : (std::size_t{320} << 20);
++    if (out.capacity() < want) {
++        out.reserve(want);
++    }
++    {
++        PorteVecBuf buf{out};
++        std::ostream os{&buf};
++        oarchive oa{os};
++        oa&* this;
++    }
++    last_size = out.size();
++    return out;
++}
++
++// (porte) rewind: the same layout as SaveStateBuffer (header + zstd data), from a raw state; safe on another thread
++std::vector<u8> System::PorteFinishState(std::span<const u8> raw, int level) const {
++    auto buffer = Common::Compression::CompressDataZSTD(raw, level);
++    CSTHeader header{};
++    header.filetype = header_magic_bytes;
++    header.program_id = title_id;
++    std::string rev_bytes;
++    CryptoPP::StringSource ss(Common::g_scm_rev, true,
++                              new CryptoPP::HexDecoder(new CryptoPP::StringSink(rev_bytes)));
++    std::memcpy(header.revision.data(), rev_bytes.data(), sizeof(header.revision));
++    header.time = std::chrono::duration_cast<std::chrono::seconds>(
++                      std::chrono::system_clock::now().time_since_epoch())
++                      .count();
++    std::vector<u8> result((u8*)&header, (u8*)&header + sizeof(header));
++    result.insert(result.end(), buffer.begin(), buffer.end());
++    return result;
++}
++
+ bool System::LoadStateBuffer(std::vector<u8> buffer) {
+     CSTHeader header;
+ 
+@@ -316,6 +374,7 @@ bool System::LoadStateBuffer(std::vector<u8> buffer) {
+     // Deserialize
+     iarchive ia{sstream};
+     ia&* this;
++    ++g_porte_load_gen;   // (porte)
+ 
+     return true;
+ }
+diff --git a/src/video_core/custom_textures/custom_tex_manager.cpp b/src/video_core/custom_textures/custom_tex_manager.cpp
+index 93a4ecf..475a6e7 100644
+--- a/src/video_core/custom_textures/custom_tex_manager.cpp
++++ b/src/video_core/custom_textures/custom_tex_manager.cpp
+@@ -61,8 +61,35 @@ CustomTexManager::CustomTexManager(Core::System& system_)
+ CustomTexManager::~CustomTexManager() = default;
+ 
+ void CustomTexManager::TickFrame() {
++    {
++        // PORTE: a new list of controller icons (the GPU thread owns the map; the old surfaces are dropped by the cache)
++        std::scoped_lock lock{porte_mutex};
++        if (porte_has_pending) {
++            porte_has_pending = false;
++            if (!workers) {
++                CreateWorkers();
++            }
++            // (the old materials may still be decoding on a worker: kept alive, never freed - a few KB per change)
++            porte_old.push_back(std::move(porte_map));
++            porte_map.clear();
++            for (const auto& [hash, file] : porte_pending) {
++                porte_textures.push_back(std::make_unique<CustomTexture>(image_interface));
++                CustomTexture* const texture{porte_textures.back().get()};
++                texture->file_format = CustomFileFormat::PNG;
++                texture->type = MapType::Color;
++                texture->path = file;
++                texture->hashes.push_back(hash);
++                auto& material = porte_map[hash];
++                material = std::make_unique<Material>();
++                material->hash = hash;
++                material->AddMapTexture(texture);
++            }
++            porte_dirty = true;
++            LOG_INFO(Render, "porte: {} controller icons", porte_map.size());
++        }
++    }
+     MICROPROFILE_SCOPE(CustomTexManager_TickFrame);
+-    if (!textures_loaded) {
++    if (!textures_loaded && porte_map.empty() && async_uploads.empty()) {   // (porte: the controller icons upload too)
+         return;
+     }
+     std::size_t num_uploads = 0;
+@@ -70,6 +97,9 @@ void CustomTexManager::TickFrame() {
+         if (num_uploads >= MAX_UPLOADS_PER_TICK) {
+             return;
+         }
++        if (porte_map.count(it->material->hash) && std::getenv("PORTE_ICONES_DIAG")) {
++            std::fprintf(stderr, "PORTE async %016llX estado %d\n", (unsigned long long)it->material->hash, (int)it->material->state.load());
++        }
+         switch (it->material->state) {
+         case DecodeState::Decoded:
+             it->func();
+@@ -287,6 +317,18 @@ void CustomTexManager::DumpTexture(const SurfaceParams& params, u32 level, std::
+     dumped_textures.insert(data_hash);
+ }
+ 
++// PORTE (22/11): controller button icons (see the header)
++void CustomTexManager::PorteSetIcons(std::vector<std::pair<u64, std::string>> icons) {
++    std::scoped_lock lock{porte_mutex};
++    porte_pending = std::move(icons);
++    porte_has_pending = true;
++}
++
++Material* CustomTexManager::PorteGetMaterial(u64 data_hash) {
++    const auto it = porte_map.find(data_hash);
++    return it == porte_map.end() ? nullptr : it->second.get();
++}
++
+ Material* CustomTexManager::GetMaterial(u64 data_hash) {
+     const auto it = material_map.find(data_hash);
+     if (it == material_map.end()) {
+diff --git a/src/video_core/custom_textures/custom_tex_manager.h b/src/video_core/custom_textures/custom_tex_manager.h
+index ba8a6b5..5740115 100644
+--- a/src/video_core/custom_textures/custom_tex_manager.h
++++ b/src/video_core/custom_textures/custom_tex_manager.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <list>
+ #include <span>
+ #include <unordered_map>
+@@ -69,6 +70,20 @@ public:
+         return use_new_hash;
+     }
+ 
++    /// PORTE (22/11): the game's button icons in the style of the connected controller. The frontend hands the list
++    /// (texture hash -> PNG to show instead, new hash); empty = the 3DS's own icons. Any thread: applied in TickFrame
++    void PorteSetIcons(std::vector<std::pair<u64, std::string>> icons);
++    bool PorteActive() const noexcept {
++        return !porte_map.empty();
++    }
++    Material* PorteGetMaterial(u64 data_hash);
++    /// true once after the style changed (the cache drops its surfaces so the icons are uploaded again)
++    bool PorteTakeDirty() noexcept {
++        const bool d = porte_dirty;
++        porte_dirty = false;
++        return d;
++    }
++
+ private:
+     /// Parses the custom texture filename (hash, material type, etc).
+     bool ParseFilename(const FileUtil::FSTEntry& file, CustomTexture* texture);
+@@ -93,6 +108,14 @@ private:
+     bool skip_mipmap{false};
+     bool flip_png_files{true};
+     bool use_new_hash{true};
++    // PORTE: controller icon packs
++    std::unordered_map<u64, std::unique_ptr<Material>> porte_map;
++    std::list<std::unordered_map<u64, std::unique_ptr<Material>>> porte_old;
++    std::vector<std::unique_ptr<CustomTexture>> porte_textures;
++    std::mutex porte_mutex;
++    std::vector<std::pair<u64, std::string>> porte_pending;
++    bool porte_has_pending{false};
++    bool porte_dirty{false};
+ };
+ 
+ } // namespace VideoCore
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 40f29fe..aa4e7b5 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include "common/archives.h"
+ #include "common/hacks/hack_manager.h"
+ #include "common/microprofile.h"
+@@ -22,6 +24,15 @@
+ #include "video_core/video_core.h"
+ 
+ namespace VideoCore {
++// PORTE (Ultra Moon, interpolação): quando ligado, limpezas e transferências passam pelo gravador do
++// frontend (interp_rec.cpp); desligado (nullptr) = Azahar original
++VideoCore::RasterizerInterface* g_porte_rasterizer_override = nullptr;
++void (*g_porte_before_swap)() = nullptr;
++void (*g_porte_after_swap)() = nullptr;
++static inline VideoCore::RasterizerInterface* PorteRast(VideoCore::RasterizerInterface* r) {
++    return g_porte_rasterizer_override ? g_porte_rasterizer_override : r;
++}
++
+ 
+ constexpr VAddr VADDR_LCD = 0x1ED02000;
+ constexpr VAddr VADDR_GPU = 0x1EF00000;
+@@ -174,6 +185,11 @@ void GPU::Execute(const Service::GSP::Command& command) {
+     }
+     case CommandId::SubmitCmdList: {
+         auto& params = command.submit_gpu_cmdlist;
++        {   // PORTE (22/11, research) PORTE_GANCHO=1: the command lists the game sends (virtual address, size)
++            static const bool log = std::getenv("PORTE_GANCHO") != nullptr;
++            static int left = 3000;
++            if (log && left > 0) { left--; std::fprintf(stderr, "CMDLIST va %08X tam %X\n", (unsigned)params.address, (unsigned)params.size); }
++        }
+         auto& cmdbuffer = regs.internal.pipeline.command_buffer;
+ 
+         // Write to the command buffer GPU registers
+@@ -420,7 +436,7 @@ void GPU::MemoryFill(u32 index, u32 intr_index) {
+     }
+ 
+     // Perform memory fill.
+-    if (!impl->rasterizer->AccelerateFill(config)) {
++    if (!PorteRast(impl->rasterizer)->AccelerateFill(config)) {
+         impl->sw_blitter->MemoryFill(config);
+     }
+ 
+@@ -462,7 +478,7 @@ void GPU::MemoryTransfer() {
+     u64 delay{};
+     // Perform memory transfer
+     if (config.is_texture_copy) {
+-        if (!impl->rasterizer->AccelerateTextureCopy(config)) {
++        if (!PorteRast(impl->rasterizer)->AccelerateTextureCopy(config)) {
+             impl->sw_blitter->TextureCopy(config);
+         }
+         delay = DelayGenerator::CalculateDelayNanoseconds(
+@@ -471,7 +487,7 @@ void GPU::MemoryTransfer() {
+     } else {
+         if (right_eye_disabler->ShouldAllowDisplayTransfer(config.GetPhysicalInputAddress(),
+                                                            config.input_height)) {
+-            if (!impl->rasterizer->AccelerateDisplayTransfer(config)) {
++            if (!PorteRast(impl->rasterizer)->AccelerateDisplayTransfer(config)) {
+                 impl->sw_blitter->DisplayTransfer(config);
+             }
+         }
+@@ -491,7 +507,9 @@ void GPU::VBlankCallback(std::uintptr_t user_data, s64 cycles_late) {
+     impl->signal_interrupt(Service::GSP::InterruptId::PDC1, 0);
+ 
+     // Present renderered frame.
++    if (g_porte_before_swap) g_porte_before_swap();   // PORTE: interpolação (quadro do meio)
+     impl->renderer->SwapBuffers();
++    if (g_porte_after_swap) g_porte_after_swap();     // PORTE: volta o framebuffer ao quadro real
+ 
+     // Reschedule recurrent event
+     impl->timing.ScheduleEvent(FRAME_TICKS - cycles_late, impl->vblank_event);
+diff --git a/src/video_core/host_shaders/vulkan_present.frag b/src/video_core/host_shaders/vulkan_present.frag
+index 3cead5b..4e058b7 100644
+--- a/src/video_core/host_shaders/vulkan_present.frag
++++ b/src/video_core/host_shaders/vulkan_present.frag
+@@ -16,6 +16,10 @@ layout (push_constant, std140) uniform DrawInfo {
+     int screen_id_r;
+     int layer;
+     int reverse_interlaced;
++    float porte_brightness;   // (porte) Gráficos > Brilho / Gama: 1 = unchanged
++    float porte_inv_gamma;
++    float porte_saturation;   // (porte) Gráficos > Saturação: 1 = unchanged
++    float porte_sharp;        // (porte) Gráficos > Nitidez 0..1, + 10 when FXAA is on
+ };
+ 
+ layout (set = 0, binding = 0) uniform sampler2D screen_textures[3];
+@@ -35,6 +39,62 @@ vec4 GetScreen(int screen_id) {
+ #endif
+ }
+ 
++vec4 GetScreenAt(int screen_id, vec2 uv) {
++#ifdef ARRAY_DYNAMIC_INDEX
++    return texture(screen_textures[screen_id], uv);
++#else
++    switch (screen_id) {
++    case 0:
++        return texture(screen_textures[0], uv);
++    case 1:
++        return texture(screen_textures[1], uv);
++    case 2:
++        return texture(screen_textures[2], uv);
++    }
++#endif
++}
++
++// (porte) FXAA (the small "console" variant): softens the stair-steps along edges, in the game picture's own pixels
++vec3 PorteFxaa(vec2 uv) {
++    const vec3 luma = vec3(0.299, 0.587, 0.114);
++    vec2 px = i_resolution.zw;
++    vec3 rgbNW = GetScreenAt(screen_id_l, uv + vec2(-1.0, -1.0) * px).rgb;
++    vec3 rgbNE = GetScreenAt(screen_id_l, uv + vec2(1.0, -1.0) * px).rgb;
++    vec3 rgbSW = GetScreenAt(screen_id_l, uv + vec2(-1.0, 1.0) * px).rgb;
++    vec3 rgbSE = GetScreenAt(screen_id_l, uv + vec2(1.0, 1.0) * px).rgb;
++    vec3 rgbM = GetScreenAt(screen_id_l, uv).rgb;
++    float lNW = dot(rgbNW, luma), lNE = dot(rgbNE, luma), lSW = dot(rgbSW, luma), lSE = dot(rgbSE, luma), lM = dot(rgbM, luma);
++    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
++    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
++    vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
++    float dirReduce = max((lNW + lNE + lSW + lSE) * (0.25 / 8.0), 1.0 / 128.0);
++    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
++    dir = clamp(dir * rcpDirMin, vec2(-8.0), vec2(8.0)) * px;
++    vec3 rgbA = 0.5 * (GetScreenAt(screen_id_l, uv + dir * (1.0 / 3.0 - 0.5)).rgb + GetScreenAt(screen_id_l, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
++    vec3 rgbB = rgbA * 0.5 + 0.25 * (GetScreenAt(screen_id_l, uv - dir * 0.5).rgb + GetScreenAt(screen_id_l, uv + dir * 0.5).rgb);
++    float lB = dot(rgbB, luma);
++    return (lB < lMin || lB > lMax) ? rgbA : rgbB;
++}
++
+ void main() {
++    bool fxaa = porte_sharp >= 5.0;
++    float sharp = fxaa ? porte_sharp - 10.0 : porte_sharp;
+     color = GetScreen(screen_id_l);
++    if (fxaa) {
++        color.rgb = PorteFxaa(frag_tex_coord);
++    }
++    if (sharp > 0.0) {   // (porte) Nitidez: the picture minus a blur of its 4 neighbours
++        vec2 px = i_resolution.zw;
++        vec3 n = GetScreenAt(screen_id_l, frag_tex_coord + vec2(0.0, -px.y)).rgb + GetScreenAt(screen_id_l, frag_tex_coord + vec2(0.0, px.y)).rgb +
++                 GetScreenAt(screen_id_l, frag_tex_coord + vec2(-px.x, 0.0)).rgb + GetScreenAt(screen_id_l, frag_tex_coord + vec2(px.x, 0.0)).rgb;
++        color.rgb = clamp(color.rgb + sharp * (4.0 * color.rgb - n), vec3(0.0), vec3(1.0));
++    }
++    if (porte_inv_gamma != 1.0) {
++        color.rgb = pow(max(color.rgb, vec3(0.0)), vec3(porte_inv_gamma));
++    }
++    if (porte_saturation != 1.0) {   // (porte) Saturação
++        float l = dot(color.rgb, vec3(0.299, 0.587, 0.114));
++        color.rgb = clamp(mix(vec3(l), color.rgb, porte_saturation), vec3(0.0), vec3(1.0));
++    }
++    color.rgb = min(color.rgb * porte_brightness, vec3(1.0));
+ }
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+index d90c638..0643a33 100644
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h
+@@ -3,6 +3,8 @@
+ // Refer to the license.txt file included.
+ 
+ #pragma once
++#include <cstdlib>
++#include "common/porte_counters.h"
+ 
+ #include <type_traits>
+ #include <boost/container/small_vector.hpp>
+@@ -116,7 +118,9 @@ void RasterizerCache<T>::TickFrame() {
+     const bool use_custom_texture_changed =
+         Settings::values.custom_textures.GetValue() != use_custom_textures;
+ 
+-    if (resolution_scale_changed || use_custom_texture_changed) {
++    // PORTE (22/11): the controller's button icons changed (connected / removed / another kind): upload again
++    const bool porte_icons_changed = custom_tex_manager.PorteTakeDirty();
++    if (resolution_scale_changed || use_custom_texture_changed || porte_icons_changed) {
+         resolution_scale_factor = scale_factor;
+         use_custom_textures = Settings::values.custom_textures.GetValue();
+         if (use_custom_textures) {
+@@ -126,10 +130,48 @@ void RasterizerCache<T>::TickFrame() {
+     }
+ }
+ 
++// PORTE (interpolação): see the comment in rasterizer_cache_base.h
++template <class T>
++bool RasterizerCache<T>::PorteSurfaceAlive(SurfaceId id, u32 incarnation) {
++    if (!slot_surfaces.PorteAlive(id, incarnation)) {
++        return false;
++    }
++    const Surface& surface = slot_surfaces[id];
++    return True(surface.flags & SurfaceFlagBits::Registered) &&
++           surface.IsRegionValid(surface.GetInterval()) &&
++           surface.texture_type != TextureType::CubeMap;
++}
++
++// PORTE (gravar e repetir): every surface sentenced since "since" is used by commands recorded now - it is not
++// destroyed (nor recycled) before the GPU passes "now"
++template <class T>
++void RasterizerCache<T>::PortePinSince(u64 since, u64 now) {
++    for (auto& [surface_id, tick] : sentenced) {
++        if (tick >= since && tick < now) {
++            tick = now;
++        }
++    }
++}
++
+ template <class T>
+ void RasterizerCache<T>::RunGarbageCollector() {
+     const u64 resource_free_tick = runtime.GetResourceFreeTick();
+-    for (auto it = sentenced.begin(); it != sentenced.end();) {
++    // PORTE: the newest PORTE_KEEP_FREE surfaces the GPU is done with stay in the queue for CreateSurface to recycle.
++    // Freeing each one the moment the GPU let it go meant the next frame (which wants one just like it while the
++    // previous one is still in flight) created a new GPU image every time: ~500 images a second, each a kernel call
++    // to allocate and another to free (~9% of the main thread).
++    // (test) PORTE_SEM_RECICLAR=1: the Azahar's original behaviour (free at once, no recycling of scaled-up surfaces)
++    static const bool porte_no_recycle = std::getenv("PORTE_SEM_RECICLAR") != nullptr;
++    // (22/11) when everything is unregistered (resolution / filter change: Tab with "Resolução ao acelerar"), the queue
++    // is emptied completely, as in the Azahar: surfaces of the old scale left in it were recycled and scaled up again,
++    // and ScaleUp destroys the old image AT ONCE - a barrier then named a destroyed VkImage (validation:
++    // VUID-VkImageMemoryBarrier-image-parameter; on a normal driver a crash in nvoglv64.dll, the user's two crashes)
++    const std::size_t PORTE_KEEP_FREE = (porte_no_recycle || porte_gc_all) ? 0 : 8;
++    std::size_t free_count = 0;
++    for (const auto& entry : sentenced) {
++        free_count += resource_free_tick > entry.second ? 1 : 0;
++    }
++    for (auto it = sentenced.begin(); it != sentenced.end() && free_count > PORTE_KEEP_FREE;) {
+         const auto [surface_id, resource_last_used_tick] = *it;
+         // Tick-values less than or equal to the current resource-tick are possibly still in-use.
+         // Tick-values larger than the current resource-tick are not being utilized anymore and can
+@@ -142,6 +184,7 @@ void RasterizerCache<T>::RunGarbageCollector() {
+         RemoveFramebuffers(surface_id);
+         slot_surfaces.erase(surface_id);
+         it = sentenced.erase(it);
++        free_count--;
+     }
+ }
+ 
+@@ -454,6 +497,7 @@ void RasterizerCache<T>::CopySurface(Surface& src_surface, Surface& dst_surface,
+     const u32 dst_scale = dst_surface.res_scale;
+     if (src_scale > dst_scale) {
+         dst_surface.ScaleUp(src_scale);
++        dst_surface.porte_scaled_later = true;
+     }
+ 
+     const auto src_rect = src_surface.GetScaledSubRect(subrect_params);
+@@ -557,6 +601,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureSurface(
+     const auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
+     const u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
+     const SurfaceId surface_id = GetTextureSurface(info, max_level);
++    porte_last_texture_id = surface_id;
+     return slot_surfaces[surface_id];
+ }
+ 
+@@ -1023,7 +1068,7 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
+         }
+ 
+         FlushRegion(params.addr, params.size);
+-        if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
++        if (!(use_custom_textures || custom_tex_manager.PorteActive()) || !UploadCustomSurface(surface_id, interval)) {
+             UploadSurface(surface, interval);
+         }
+         notify_validated(params.GetInterval());
+@@ -1050,6 +1095,16 @@ void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interva
+     if (!source_ptr) [[unlikely]] {
+         return;
+     }
++    {
++        static const bool porte_diag = std::getenv("PORTE_ICONES_DIAG") != nullptr;
++        if (porte_diag && load_info.width <= 32 && load_info.height <= 32) {
++            const auto bytes = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
++            std::fprintf(stderr, "NORMAL %ux%u fmt %u hash %016llX custom_on %d porte %d\n", load_info.width, load_info.height,
++                         static_cast<u32>(load_info.pixel_format),
++                         static_cast<unsigned long long>(Common::ComputeHash64<Common::HashAlgo64::CityHash>(bytes.data(), bytes.size())),
++                         (int)use_custom_textures, (int)custom_tex_manager.PorteActive());
++        }
++    }
+ 
+     const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+     DecodeTexture(load_info, load_info.addr, load_info.end, upload_data, staging.mapped,
+@@ -1101,10 +1156,25 @@ bool RasterizerCache<T>::UploadCustomSurface(SurfaceId surface_id, SurfaceInterv
+     }
+ 
+     const auto upload_data = source_ptr.GetWriteBytes(load_info.end - load_info.addr);
+-    const u64 hash = ComputeHash(load_info, upload_data);
++    // PORTE (22/11): the controller's button icons first (small textures only: a hash per upload costs)
++    Material* material = nullptr;
++    if (custom_tex_manager.PorteActive() && load_info.width * load_info.height <= 256 * 256) {
++        const u64 porte_hash = Common::ComputeHash64<Common::HashAlgo64::CityHash>(upload_data.data(), upload_data.size());
++        material = custom_tex_manager.PorteGetMaterial(porte_hash);
++        static const bool porte_diag = std::getenv("PORTE_ICONES_DIAG") != nullptr;
++        if (porte_diag && load_info.width <= 32 && load_info.height <= 32) {
++            std::fprintf(stderr, "ICONE %ux%u fmt %u hash %016llX %s\n", load_info.width, load_info.height,
++                         static_cast<u32>(load_info.pixel_format), static_cast<unsigned long long>(porte_hash), material ? "TROCADO" : "-");
++        }
++    }
++    if (!material) {
++        if (!use_custom_textures) {
++            return surface.IsCustom();
++        }
++        material = custom_tex_manager.GetMaterial(ComputeHash(load_info, upload_data));
++    }
+ 
+     const u32 level = surface.LevelOf(load_info.addr);
+-    Material* material = custom_tex_manager.GetMaterial(hash);
+ 
+     if (!material) {
+         return surface.IsCustom();
+@@ -1211,6 +1281,7 @@ bool RasterizerCache<T>::ValidateByReinterpretation(Surface& surface, SurfacePar
+         const u32 res_scale = src_surface.res_scale;
+         if (res_scale > surface.res_scale) {
+             surface.ScaleUp(res_scale);
++            surface.porte_scaled_later = true;
+         }
+         const PAddr addr = boost::icl::lower(interval);
+         const SurfaceParams copy_params = surface.FromInterval(copy_interval);
+@@ -1372,16 +1443,27 @@ SurfaceId RasterizerCache<T>::CreateSurface(const SurfaceParams& params,
+             return (slot_surfaces[pair.first] == params) &&
+                    // Only recycle the texture if its resolution scale is equal or less than the
+                    // incoming texture
+-                   (slot_surfaces[pair.first].res_scale <= params.res_scale) &&
++                   (slot_surfaces[pair.first].res_scale <= params.res_scale ||
++                    (slot_surfaces[pair.first].porte_scaled_later && !std::getenv("PORTE_SEM_RECICLAR") &&
++                     slot_surfaces[pair.first].res_scale == resolution_scale_factor)) &&
+                    // Only recycle the texture if the texture runtime is completely done with it
+                    (resource_free_tick > pair.second);
+         });
+         // If a matching texture was found in the deletion queue, recycle it.
+         if (it != sentenced.end()) {
++            // PORTE: a recycled surface gets new contents - the repeats stop if the recording may name it
++            if (it->second >= Common::g_porte_cap_since) {
++                ++Common::g_porte_recycle_gen;
++            }
+             const SurfaceId surface_id = it->first;
++            ++Common::g_porte_surf_rec;
++            if (slot_surfaces[surface_id].res_scale > params.res_scale) {
++                ++Common::g_porte_surf_rec_big;
++            }
+             sentenced.erase(it);
+             return surface_id;
+         }
++        ++Common::g_porte_surf_new;
+         return slot_surfaces.insert(runtime, params, initial_flags);
+     }();
+     Surface& surface = slot_surfaces[surface_id];
+@@ -1436,6 +1518,7 @@ void RasterizerCache<T>::UnregisterSurface(SurfaceId surface_id) {
+         return;
+     }
+ 
++    ++Common::g_porte_fill_erases; // PORTE: a fill surface has no GPU image
+     slot_surfaces.erase(surface_id);
+ }
+ 
+@@ -1448,7 +1531,9 @@ void RasterizerCache<T>::UnregisterAll() {
+         }
+     }
+     runtime.Finish();
++    porte_gc_all = true;
+     RunGarbageCollector();
++    porte_gc_all = false;
+ }
+ 
+ template <class T>
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache_base.h b/src/video_core/rasterizer_cache/rasterizer_cache_base.h
+index 071235e..456a183 100644
+--- a/src/video_core/rasterizer_cache/rasterizer_cache_base.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache_base.h
+@@ -58,6 +58,9 @@ class CustomTexManager;
+ class RendererBase;
+ enum class SurfaceFlagBits : u32;
+ 
++// PORTE (22/11): RunGarbageCollector frees every free surface (UnregisterAll: resolution / filter change)
++inline bool porte_gc_all = false;
++
+ template <class T>
+ class RasterizerCache {
+     /// Address shift for caching surfaces into a hash table
+@@ -115,6 +118,23 @@ public:
+ 
+     /// Get a surface based on the texture configuration
+     Surface& GetTextureSurface(const Pica::TexturingRegs::FullTextureConfig& config);
++    /// PORTE (interpolação): the id of the surface the call above returned last; and a surface by id
++    SurfaceId porte_last_texture_id{};
++    Surface& PorteSurface(SurfaceId id) {
++        return slot_surfaces[id];
++    }
++    u32 PorteSurfaceIncarnation(SurfaceId id) const {
++        return slot_surfaces.PorteIncarnation(id);
++    }
++    // reusable without a new lookup only if ALL of these hold (otherwise the normal lookup runs):
++    // - the same live object (slot neither emptied nor reused);
++    // - still REGISTERED in the cache: an unregistered surface is "sentenced" (waiting to be destroyed when the
++    //   GPU passes its tick) - drawing with it after that tick is a use-after-free (Device lost, 20/11);
++    //   temporary surfaces (textures not a multiple of 8) are never registered, so they are never reused;
++    // - no invalid region: the lookup would copy/upload new contents first (ValidateSurface);
++    // - not a cube map (its faces are assembled by the lookup).
++    bool PorteSurfaceAlive(SurfaceId id, u32 incarnation);   // (rasterizer_cache.h)
++    void PortePinSince(u64 since, u64 now);                    // (rasterizer_cache.h)
+     SurfaceId GetTextureSurface(const Pica::Texture::TextureInfo& info, u32 max_level = 0);
+ 
+     /// Get a texture cube based on the texture configuration
+diff --git a/src/video_core/rasterizer_cache/surface_base.h b/src/video_core/rasterizer_cache/surface_base.h
+index e5bab22..1495423 100644
+--- a/src/video_core/rasterizer_cache/surface_base.h
++++ b/src/video_core/rasterizer_cache/surface_base.h
+@@ -26,6 +26,11 @@ DECLARE_ENUM_FLAG_OPERATORS(SurfaceFlagBits);
+ 
+ class SurfaceBase : public SurfaceParams {
+ public:
++    /// PORTE: created at a lower scale and scaled up afterwards by a copy / reinterpretation (Ultra Moon reads its
++    /// 3x depth buffer as a 1x RGBA texture every frame). A new request for the same surface at the lower scale may
++    /// recycle it: it would be scaled up the same way.
++    bool porte_scaled_later = false;
++
+     SurfaceBase(const SurfaceParams& params, const SurfaceFlagBits& initial_flag_bits);
+     ~SurfaceBase();
+ 
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.cpp b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+index 5221fdf..3d46eab 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -34,6 +34,14 @@
+ 
+ MICROPROFILE_DEFINE(Vulkan_RenderFrame, "Vulkan", "Render Frame", MP_RGB(128, 128, 64));
+ 
++namespace VideoCore {
++// (porte) picture brightness and 1/gamma for the present shader, set by the frontend's menu
++float g_porte_brightness = 1.0f;
++float g_porte_inv_gamma = 1.0f;
++float g_porte_saturation = 1.0f;
++float g_porte_sharp = 0.0f;   // sharpness 0..1, + 10 when FXAA is on
++} // namespace VideoCore
++
+ namespace Vulkan {
+ 
+ struct ScreenRectVertex {
+@@ -139,7 +147,11 @@ RendererVulkan::~RendererVulkan() {
+     vk::Device device = instance.GetDevice();
+     scheduler.Finish();
+     main_present_window.WaitPresent();
+-    device.waitIdle();
++    {
++        // PORTE: the Ultra Moon presenter thread uses the queue (present) under this lock - wait under it too
++        std::scoped_lock lock{scheduler.submit_mutex};
++        device.waitIdle();
++    }
+ 
+     device.destroyShaderModule(present_vertex_shader);
+     for (u32 i = 0; i < PRESENT_PIPELINES; i++) {
+@@ -1027,6 +1039,10 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout&
+     const auto& top_screen = layout.top_screen;
+     const auto& bottom_screen = layout.bottom_screen;
+     draw_info.modelview = MakeOrthographicMatrix(layout.width, layout.height);
++    draw_info.porte_brightness = VideoCore::g_porte_brightness;
++    draw_info.porte_inv_gamma = VideoCore::g_porte_inv_gamma;
++    draw_info.porte_saturation = VideoCore::g_porte_saturation;
++    draw_info.porte_sharp = VideoCore::g_porte_sharp;
+ 
+     draw_info.layer = 0;
+ 
+@@ -1183,6 +1199,22 @@ void RendererVulkan::SwapBuffers() {
+     EndFrame();
+ }
+ 
++// (called from the Ultra Moon frontend without its headers)
++void PorteExtraPresent(VideoCore::RendererBase* r) {
++    if (auto* rv = dynamic_cast<RendererVulkan*>(r)) {
++        rv->PorteExtraPresent();
++    }
++}
++
++void RendererVulkan::PorteExtraPresent() {
++    const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
++    PrepareRendertarget();
++    // (porte) a screenshot asked meanwhile is taken from this picture too: with the game paused (modo foto) there is
++    // no normal swap to take it
++    RenderScreenshot();
++    RenderToWindow(main_present_window, layout, false);
++}
++
+ void RendererVulkan::RenderScreenshot() {
+     if (!settings.screenshot_requested.exchange(false)) {
+         return;
+diff --git a/src/video_core/renderer_vulkan/renderer_vulkan.h b/src/video_core/renderer_vulkan/renderer_vulkan.h
+index 2f1c261..f6ce218 100644
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.h
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.h
+@@ -62,8 +62,13 @@ struct PresentUniformData {
+     int screen_id_r = 0;
+     int layer = 0;
+     int reverse_interlaced = 0;
++    // (porte) Gráficos > Brilho / Gama, applied by vulkan_present.frag (1 = unchanged)
++    f32 porte_brightness = 1.0f;
++    f32 porte_inv_gamma = 1.0f;
++    f32 porte_saturation = 1.0f;   // (porte) Gráficos > Saturação (1 = unchanged)
++    f32 porte_sharp = 0.0f;        // (porte) Gráficos > Nitidez 0..1, + 10 when FXAA is on
+ };
+-static_assert(sizeof(PresentUniformData) == 112,
++static_assert(sizeof(PresentUniformData) == 128,
+               "PresentUniformData does not structure in shader!");
+ 
+ class RendererVulkan : public VideoCore::RendererBase {
+@@ -83,6 +88,10 @@ public:
+     void SwapBuffers() override;
+     void TryPresent(int timeout_ms, bool is_secondary) override {}
+ 
++    // PORTE (Ultra Moon, interpolação): mostra de novo o que está nos framebuffers dos LCDs agora, como um
++    // quadro a mais para o apresentador, sem contar como quadro do jogo (sem limitador / estatísticas)
++    void PorteExtraPresent();
++
+ private:
+     void ReloadPipeline(Settings::StereoRenderOption render_3d);
+     void CompileShaders();
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 290b187..c914d88 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <chrono>
++#include "common/porte_counters.h"
+ #include <boost/container/static_vector.hpp>
+ 
+ #include "common/alignment.h"
+@@ -108,6 +110,15 @@ bool GraphicsPipeline::TryBuild(bool wait_built) {
+ 
+ bool GraphicsPipeline::Build(bool fail_on_compile_required) {
+     MICROPROFILE_SCOPE(Vulkan_Pipeline);
++    // PORTE (22/11): how many pipelines are built and how long they take (advanced log)
++    struct PorteTime {
++        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        ~PorteTime() {
++            ++Common::g_porte_pipe_builds;
++            Common::g_porte_pipe_us += (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
++                std::chrono::steady_clock::now() - t0).count();
++        }
++    } porte_time;
+ 
+     const u32 stride_alignment = instance.GetMinVertexStrideAlignment();
+     std::array<vk::VertexInputBindingDescription, MAX_VERTEX_BINDINGS> bindings;
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 53ffcc4..555dd94 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -377,7 +377,15 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
+ 
+     const bool is_dirty = scheduler.IsStateDirty(StateFlags::Pipeline);
+     const bool pipeline_dirty = (current_pipeline != pipeline) || is_dirty;
+-    scheduler.Record([this, is_dirty, pipeline_dirty, pipeline,
++    // PORTE: while recording, each bind gets a slot; a repeat gives each slot a new vertex shader uniform offset
++    int porte_slot = -1;
++    if (g_porte_capturing) {
++        porte_slot = static_cast<int>(g_porte_capturing->slot_draw.size());
++        g_porte_capturing->slot_draw.push_back(g_porte_draw_idx);
++        g_porte_capturing->slot_offset0.push_back(offsets[0]);
++        g_porte_capturing->slot_top.push_back(g_porte_draw_top ? 1 : 0);
++    }
++    scheduler.Record([this, is_dirty, pipeline_dirty, pipeline, porte_slot,
+                       current_dynamic = current_info.dynamic_info, dynamic = info.dynamic_info,
+                       descriptor_sets = bound_descriptor_sets, offsets = offsets,
+                       current_rasterization = current_info.state.rasterization,
+@@ -485,8 +493,12 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
+             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+         }
+ 
++        auto bind_offsets = offsets;
++        if (porte_slot >= 0 && g_porte_exec_table) {
++            bind_offsets[0] = g_porte_exec_table[porte_slot];
++        }
+         cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
+-                                  descriptor_sets, offsets);
++                                  descriptor_sets, bind_offsets);
+     });
+ 
+     current_info = info;
+diff --git a/src/video_core/renderer_vulkan/vk_present_window.h b/src/video_core/renderer_vulkan/vk_present_window.h
+index 3773d37..3e6af7f 100644
+--- a/src/video_core/renderer_vulkan/vk_present_window.h
++++ b/src/video_core/renderer_vulkan/vk_present_window.h
+@@ -36,6 +36,8 @@ struct Frame {
+ 
+ class PresentWindow final {
+ public:
++    /// (porte) frames free right now: the interpolation skips in-between pictures instead of waiting
++    std::size_t FreeFrameCount();
+     explicit PresentWindow(Frontend::EmuWindow& emu_window, const Instance& instance,
+                            Scheduler& scheduler, bool low_refresh_rate);
+     ~PresentWindow();
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 96fe552..1f99d86 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,3 +1,8 @@
++#include "common/porte_counters.h"
++#include <map>
++#include <cstdio>
++#include <cstdlib>
++#include <chrono>
+ // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+@@ -18,6 +23,11 @@
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+ #include "video_core/texture/texture_decode.h"
+ 
++namespace VideoCore {
++// (porte) real 16:9: the game's projection is widened (c87 = the long axis of the top screen, ×0.9375 = 400/426.7)
++float g_porte_wide_proj = 1.0f;
++} // namespace VideoCore
++
+ namespace Vulkan {
+ 
+ namespace {
+@@ -425,6 +435,15 @@ bool RasterizerVulkan::SetupGeometryShader() {
+     return pipeline_cache.UseFixedGeometryShader(regs);
+ }
+ 
++// PORTE (interpolação): tempo por etapa do desenho (ms somados; g_porte_prof_on liga)
++bool g_porte_prof_on = false;
++double g_porte_prof[10] = {};
++static inline double PorteT() {
++    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++#define PORTE_T0() const double porte_t0 = g_porte_prof_on ? PorteT() : 0; double porte_tl = porte_t0
++#define PORTE_MARK(i) do { if (g_porte_prof_on) { const double n_ = PorteT(); g_porte_prof[i] += n_ - porte_tl; porte_tl = n_; } } while (0)
++
+ bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
+     if (regs.pipeline.use_gs != Pica::PipelineRegs::UseGS::No) {
+         if (regs.pipeline.gs_config.mode != Pica::PipelineRegs::GSMode::Point) {
+@@ -445,12 +464,15 @@ bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
+ 
+     // Vertex data setup might involve scheduler flushes so perform it
+     // early to avoid invalidating our state in the middle of the draw.
++    PORTE_T0();
+     vertex_info = AnalyzeVertexArray(is_indexed, instance.GetMinVertexStrideAlignment());
+     if (vertex_info.Invalid()) {
+         // Do not draw anything if the vertex array is invalid.
+         return true;
+     }
++    PORTE_MARK(0);
+     SetupVertexArray();
++    PORTE_MARK(1);
+ 
+     if (!SetupVertexShader()) {
+         return false;
+@@ -458,6 +480,7 @@ bool RasterizerVulkan::AccelerateDrawBatch(bool is_indexed) {
+     if (!SetupGeometryShader()) {
+         return false;
+     }
++    PORTE_MARK(2);
+ 
+     return Draw(true, is_indexed);
+ }
+@@ -467,8 +490,15 @@ bool RasterizerVulkan::AccelerateDrawBatchInternal(bool is_indexed) {
+         SetupIndexArray();
+     }
+ 
+-    const bool wait_built = !async_shaders || regs.pipeline.num_vertices <= 6;
++    // (porte 21/11) 2D draws (menus, text, cards: not the game's 3D model layout, c89 = 0 0 -1 0) wait for their
++    // shader: skipped for a frame they left the title menu's notebook page blank (a flash on every start); the 3D
++    // models keep compiling in the background (no stutter the first time an effect shows up)
++    const auto& pf = pica.vs_setup.uniforms.f;
++    const bool porte3d = pf[89].z.ToFloat32() == -1.0f && pf[89].w.ToFloat32() == 0.0f;
++    const bool wait_built = !async_shaders || regs.pipeline.num_vertices <= 6 || !porte3d;
++    g_porte_draw_top = pica.regs.internal.framebuffer.framebuffer.height >= 384;   // (porte 16:9: for the repeats)
+     if (!pipeline_cache.BindPipeline(pipeline_info, wait_built)) {
++        ++Common::g_porte_async_skips; // (porte) the interpolation drops a redraw that skipped a draw
+         return true;
+     }
+ 
+@@ -540,7 +570,9 @@ void RasterizerVulkan::DrawTriangles() {
+ 
+ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
+     MICROPROFILE_SCOPE(Vulkan_Drawing);
++    PORTE_T0();
+     SyncDrawState();
++    PORTE_MARK(3);
+ 
+     const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
+     const bool has_stencil = regs.framebuffer.HasStencil();
+@@ -555,6 +587,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
+          (has_stencil && pipeline_info.state.depth_stencil.stencil_test_enable));
+ 
+     const auto fb_helper = res_cache.GetFramebufferSurfaces(using_color_fb, using_depth_fb);
++    PORTE_MARK(4);
+     const Framebuffer* framebuffer = fb_helper.Framebuffer();
+     if (!framebuffer->Handle()) {
+         return true;
+@@ -578,18 +611,22 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
+     // Sync and bind the texture surfaces
+     SyncTextureUnits(framebuffer);
+     SyncUtilityTextures(framebuffer);
++    PORTE_MARK(5);
+ 
+     // Sync and bind the shader
+     pipeline_cache.UseFragmentShader(regs, user_config);
++    PORTE_MARK(6);
+ 
+     // Sync the LUTs within the texture buffer
+     SyncAndUploadLUTs();
+     SyncAndUploadLUTsLF();
+     UploadUniforms(accelerate);
++    PORTE_MARK(7);
+ 
+     // Begin rendering
+     const auto draw_rect = fb_helper.DrawRect();
+     renderpass_cache.BeginRendering(framebuffer, draw_rect);
++    PORTE_MARK(8);
+ 
+     // Configure viewport and scissor
+     const auto viewport = fb_helper.Viewport();
+@@ -606,6 +643,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
+     if (accelerate) {
+         succeeded = AccelerateDrawBatchInternal(is_indexed);
+     } else {
++        g_porte_draw_top = pica.regs.internal.framebuffer.framebuffer.height >= 384;   // (porte 16:9: for the repeats)
+         pipeline_cache.BindPipeline(pipeline_info, true);
+ 
+         const u32 vertex_count = static_cast<u32>(vertex_batch.size());
+@@ -621,10 +659,35 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
+         });
+     }
+ 
++    PORTE_MARK(9);
+     vertex_batch.clear();
+     return succeeded;
+ }
+ 
++// PORTE (interpolação): within one sequence of redraws of the same picture (the game does not run in
++// between), the texture lookups of each draw give the same surfaces. The first redraw notes, per draw and
++// unit, WHICH surface (its slot id, never a Vulkan handle) (mode 1); the next ones (mode 2) take that surface
++// object directly - its views are read from the live object at that moment - instead of searching the cache.
++// A note is used only while each surface it names is still the same live object (slot not emptied nor
++// reused: SlotVector incarnation): a destroyed surface can never be reached.
++int g_porte_memo_mode = 0;
++u32 g_porte_memo_idx = 0;
++u64 g_porte_memo_hit = 0, g_porte_memo_miss = 0, g_porte_memo_stale = 0;
++struct PorteTexMemo {
++    bool valid = false;
++    u64 gen = 0;
++    u8 kind[3] = {};                 // 0 null 2D, 1 null cube, 2 shadow 2D, 3 normal texture
++    VideoCore::SurfaceId id[3];
++    u32 inc[3] = {};                 // which object occupied each slot when noted
++};
++static std::vector<PorteTexMemo> s_porte_tex_memo;
++
++void PorteMemoReset() {
++    for (PorteTexMemo& m : s_porte_tex_memo) {
++        m.valid = false;
++    }
++}
++
+ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+ 
+@@ -634,6 +697,63 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+     const auto texture_set = pipeline_cache.Acquire(use_cube_heap ? DescriptorHeapType::Texture
+                                                                   : DescriptorHeapType::Texture);
+ 
++    // mode 2: the surfaces noted by the first redraw (only if the cache did not change since)
++    if (g_porte_memo_mode == 2 && pica_textures.size() == 3 && g_porte_memo_idx < s_porte_tex_memo.size()) {
++        const PorteTexMemo& m = s_porte_tex_memo[g_porte_memo_idx];
++        // each noted surface must still be the same live object (its slot neither emptied nor reused)
++        bool alive = m.valid;
++        for (u32 i = 0; i < 3 && alive; i++) {
++            if (m.kind[i] >= 2 && !res_cache.PorteSurfaceAlive(m.id[i], m.inc[i])) {
++                alive = false;
++            }
++        }
++        if (m.valid && !alive) {
++            g_porte_memo_stale++;
++        }
++        if (!m.valid) {
++            g_porte_memo_miss++;
++        }
++        if (alive) {
++            g_porte_memo_hit++;
++            for (u32 i = 0; i < 3; i++) {
++                const auto& texture = pica_textures[i];
++                switch (m.kind[i]) {
++                case 0: {
++                    Surface& s = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
++                    const Sampler& sm = res_cache.GetSampler(VideoCore::NULL_SURFACE_ID);
++                    update_queue.AddImageSampler(texture_set, i, 0, s.ImageView(), sm.Handle());
++                    break;
++                }
++                case 1: {
++                    Surface& s = res_cache.GetSurface(VideoCore::NULL_SURFACE_CUBE_ID);
++                    const Sampler& sm = res_cache.GetSampler(VideoCore::NULL_SURFACE_CUBE_ID);
++                    update_queue.AddImageSampler(texture_set, i, 0, s.ImageView(), sm.Handle());
++                    break;
++                }
++                case 2: {
++                    Surface& s = res_cache.PorteSurface(m.id[i]);
++                    Sampler& sm = res_cache.GetSampler(texture.config);
++                    update_queue.AddImageSampler(texture_set, i, 0, s.StorageView(), sm.Handle());
++                    break;
++                }
++                default: {
++                    Surface& s = res_cache.PorteSurface(m.id[i]);
++                    Sampler& sm = res_cache.GetSampler(texture.config);
++                    const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
++                    const bool is_feedback_loop = color_view == s.FramebufferView();
++                    update_queue.AddImageSampler(texture_set, i, 0,
++                                                 is_feedback_loop ? s.CopyImageView() : s.ImageView(),
++                                                 sm.Handle());
++                    break;
++                }
++                }
++            }
++            return;
++        }
++    }
++    PorteTexMemo memo_now{};
++    memo_now.valid = g_porte_memo_mode == 1 && pica_textures.size() == 3;
++
+     for (u32 texture_index = 0; texture_index < pica_textures.size(); ++texture_index) {
+         const auto& texture = pica_textures[texture_index];
+ 
+@@ -646,6 +766,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+                 const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_CUBE_ID);
+                 update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                              null_surface.ImageView(), null_sampler.Handle());
++                if (texture_index < 3) memo_now.kind[texture_index] = 1;
+                 break;
+             }
+             default: {
+@@ -653,6 +774,7 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+                 const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_ID);
+                 update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                              null_surface.ImageView(), null_sampler.Handle());
++                if (texture_index < 3) memo_now.kind[texture_index] = 0;
+                 break;
+             }
+             }
+@@ -668,14 +790,19 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+                 surface.flags |= VideoCore::SurfaceFlagBits::ShadowSource;
+                 update_queue.AddImageSampler(texture_set, texture_index, 0, surface.StorageView(),
+                                              sampler.Handle());
++                memo_now.kind[0] = 2;
++                memo_now.id[0] = res_cache.porte_last_texture_id;
++                memo_now.inc[0] = res_cache.PorteSurfaceIncarnation(memo_now.id[0]);
+                 continue;
+             }
+             case TextureType::ShadowCube: {
+                 BindShadowCube(texture, texture_set);
++                memo_now.valid = false;
+                 continue;
+             }
+             case TextureType::TextureCube: {
+                 BindTextureCube(texture, texture_set);
++                memo_now.valid = false;
+                 continue;
+             }
+             default:
+@@ -685,6 +812,11 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+ 
+         // Bind the texture provided by the rasterizer cache
+         Surface& surface = res_cache.GetTextureSurface(texture);
++        if (texture_index < 3) {
++            memo_now.kind[texture_index] = 3;
++            memo_now.id[texture_index] = res_cache.porte_last_texture_id;
++            memo_now.inc[texture_index] = res_cache.PorteSurfaceIncarnation(memo_now.id[texture_index]);
++        }
+         Sampler& sampler = res_cache.GetSampler(texture.config);
+         const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
+         const bool is_feedback_loop = color_view == surface.FramebufferView();
+@@ -692,6 +824,14 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
+             is_feedback_loop ? surface.CopyImageView() : surface.ImageView();
+         update_queue.AddImageSampler(texture_set, texture_index, 0, texture_view, sampler.Handle());
+     }
++    if (g_porte_memo_mode == 1) {
++        if (s_porte_tex_memo.size() <= g_porte_memo_idx) {
++            s_porte_tex_memo.resize(g_porte_memo_idx + 64);
++        }
++        // (noted after all the lookups of this draw: whatever they created or destroyed is already counted)
++        memo_now.gen = (Common::g_porte_slot_gen - Common::g_porte_fill_erases);
++        s_porte_tex_memo[g_porte_memo_idx] = memo_now;
++    }
+ }
+ 
+ void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
+@@ -984,6 +1124,29 @@ void RasterizerVulkan::SyncAndUploadLUTs() {
+ }
+ 
+ void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
++    // (porte) 16:9: the widening applies to draws into the top screen only - when the target changes between the two
++    // screens the uniforms are sent again (the same values may need the factor or not)
++    // (the game draws the top screen into a 256x512 buffer and copies the 240x400 part: "tall" = the top screen; the
++    // bottom one is 320 long)
++    const bool portTop = pica.regs.internal.framebuffer.framebuffer.height >= 384;
++    // (porte) read once: getenv walks the whole environment comparing text, and this runs for every draw (and for
++    // every re-execution of the interpolation) - it cost ~7% of the main thread
++    static const bool porte_diag16 = std::getenv("PORTE_16X9_DIAG") != nullptr;
++    if (porte_diag16 && accelerate_draw) {   // (diagnosis) the render targets of the draws
++        static std::map<u64, int> seen;
++        const auto& fbr = pica.regs.internal.framebuffer.framebuffer;
++        const auto& f = pica.vs_setup.uniforms.f;
++        const bool g = f[89].z.ToFloat32() == -1.0f && f[89].w.ToFloat32() == 0.0f;
++        const u64 key = ((u64)fbr.width.Value() << 32) | ((u64)fbr.height.Value() << 1) | (g ? 1 : 0);
++        if (seen[key]++ == 0)
++            std::fprintf(stderr, "16x9: destino %ux%u cor %08X layout_jogo %d\n", (unsigned)fbr.width.Value(), (unsigned)fbr.height.Value(),
++                         (unsigned)fbr.GetColorBufferPhysicalAddress(), g ? 1 : 0);
++    }
++    static bool portLastTop = true;
++    if (VideoCore::g_porte_wide_proj != 1.0f && portTop != portLastTop) pica.vs_setup.uniforms_dirty = true;
++    portLastTop = portTop;
++    static float portLastWide = 1.0f;
++    if (VideoCore::g_porte_wide_proj != portLastWide) { pica.vs_setup.uniforms_dirty = true; portLastWide = VideoCore::g_porte_wide_proj; }
+     const bool sync_vs_pica = accelerate_draw && pica.vs_setup.uniforms_dirty;
+     if (!sync_vs_pica && !vs_data_dirty && !fs_data_dirty) {
+         return;
+@@ -1013,6 +1176,27 @@ void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
+     if (sync_vs_pica || invalidate) {
+         VSPicaUniformData vs_uniforms;
+         vs_uniforms.SetFromRegs(pica.vs_setup);
++        // (porte) 16:9: the game's 3D draws keep their projection in c86-c89 (c89 = 0 0 -1 0); only the copy sent to the
++        // GPU changes (the game's own registers stay as they are: the interpolation replays get the same factor here)
++        if (VideoCore::g_porte_wide_proj != 1.0f && portTop) {
++            auto& f = vs_uniforms.f;
++            if (f[89][0] == 0.0f && f[89][1] == 0.0f && f[89][2] == -1.0f && f[89][3] == 0.0f) {
++                for (int k = 0; k < 4; k++) f[87][k] *= VideoCore::g_porte_wide_proj;
++            }
++            else if (porte_diag16) {
++                // (diagnosis) other shaders: registers that look like a projection row (a lone -1 in z, 0 in w)
++                static int left = 30;
++                for (int r = 0; r < 96 && left > 0; r++) {
++                    if (f[r][2] == -1.0f && f[r][3] == 0.0f && f[r][0] == 0.0f && f[r][1] == 0.0f) {
++                        left--;
++                        std::fprintf(stderr, "16x9: outro shader, projeção em c%d? c%d=(%.3f %.3f %.3f %.3f) c%d=(%.3f %.3f %.3f %.3f) c%d=(%.3f %.3f %.3f %.3f)\n",
++                                     r - 3, r - 3, f[r - 3][0], f[r - 3][1], f[r - 3][2], f[r - 3][3], r - 2, f[r - 2][0], f[r - 2][1], f[r - 2][2], f[r - 2][3],
++                                     r - 1, f[r - 1][0], f[r - 1][1], f[r - 1][2], f[r - 1][3]);
++                        break;
++                    }
++                }
++            }
++        }
+         std::memcpy(uniforms + used_bytes, &vs_uniforms, sizeof(vs_uniforms));
+         pipeline_cache.UpdateRange(0, offset + used_bytes);
+         pica.vs_setup.uniforms_dirty = false;
+@@ -1037,4 +1221,148 @@ void RasterizerVulkan::SwitchDiskResources(u64 title_id) {
+     }
+ }
+ 
++// ---------------------------------------------------------------- PORTE: gravar e repetir (porte_repeat.h)
++void RasterizerVulkan::PorteCaptureBegin() {
++    porte_cap = std::make_shared<PorteCapture>();
++    porte_cap_valid = false;
++    // the recording must not depend on anything set before it: close the render pass and make everything
++    // (pipeline, descriptor sets, all uniforms) be set again by its first draw
++    renderpass_cache.EndRendering();
++    vs_data_dirty = true;
++    fs_data_dirty = true;
++    pica.vs_setup.uniforms_dirty = true;
++    scheduler.MakeDirty(StateFlags::Pipeline | StateFlags::DescriptorSets);
++    StreamBuffer* const rings[4] = {&stream_buffer, &uniform_buffer, &texture_buffer, &texture_lf_buffer};
++    for (std::size_t i = 0; i < 4; i++) {
++        porte_lo[i] = rings[i]->PorteOffset();
++        porte_wraps[i] = rings[i]->PorteWraps();
++    }
++    porte_cap_gen = (Common::g_porte_slot_gen - Common::g_porte_fill_erases);
++    porte_cap_tick = scheduler.CurrentTick();
++    Common::g_porte_cap_since = porte_cap_tick;   // (a surface recycled from before this cannot be in the recording)
++    g_porte_capturing = porte_cap.get();
++}
++
++bool RasterizerVulkan::PorteCaptureEnd() {
++    renderpass_cache.EndRendering(); // (recorded: the recording ends with the render pass closed)
++    g_porte_capturing = nullptr;
++    bool ok = porte_cap && !porte_cap->bad && !porte_cap->cmds.empty();
++    StreamBuffer* const rings[4] = {&stream_buffer, &uniform_buffer, &texture_buffer, &texture_lf_buffer};
++    for (std::size_t i = 0; i < 4; i++) {
++        // went back to the start while recording: the recorded regions are not one block
++        if (rings[i]->PorteWraps() != porte_wraps[i]) {
++            ok = false;
++        }
++        porte_hi[i] = rings[i]->PorteOffset();
++    }
++    // a slot emptied or replaced while recording (surfaces only SENTENCED are fine: they are pinned below)
++    if ((Common::g_porte_slot_gen - Common::g_porte_fill_erases) != porte_cap_gen) {
++        ok = false;
++    }
++    porte_cap_recycle = Common::g_porte_recycle_gen;
++    porte_cap_valid = ok;
++    static int porte_diag = std::getenv("PORTE_INTERP_DIAG") ? 30 : 0;
++    if (!ok && porte_diag > 0) {
++        porte_diag--;
++        std::fprintf(stderr, "repetir: gravação recusada: bad=%d cmds=%zu voltas=%d%d%d%d gen %llu->%llu binds=%zu sets=%zu\n",
++                     porte_cap ? (int)porte_cap->bad : -1, porte_cap ? porte_cap->cmds.size() : 0,
++                     (int)(rings[0]->PorteWraps() != porte_wraps[0]), (int)(rings[1]->PorteWraps() != porte_wraps[1]),
++                     (int)(rings[2]->PorteWraps() != porte_wraps[2]), (int)(rings[3]->PorteWraps() != porte_wraps[3]),
++                     (unsigned long long)porte_cap_gen, (unsigned long long)(Common::g_porte_slot_gen - Common::g_porte_fill_erases),
++                     porte_cap ? porte_cap->slot_draw.size() : 0, porte_cap ? porte_cap->sets.size() : 0);
++    }
++    return ok;
++}
++
++bool RasterizerVulkan::PorteRepeat(const Pica::Uniforms* const* per_draw, std::size_t count) {
++    // a slot emptied/replaced since the recording began, or a surface recycled since it ended: the recorded
++    // commands may name it - no more repeats
++    if (!porte_cap_valid || (Common::g_porte_slot_gen - Common::g_porte_fill_erases) != porte_cap_gen ||
++        Common::g_porte_recycle_gen != porte_cap_recycle) {
++        porte_cap_valid = false;
++        return false;
++    }
++    renderpass_cache.EndRendering();
++    const auto cap = porte_cap;
++    const std::size_t n = cap->slot_draw.size();
++    auto table = std::make_shared<std::vector<u32>>(cap->slot_offset0);
++    if (n > 0) {
++        const u32 bytes = static_cast<u32>(n) * uniform_size_aligned_vs_pica;
++        if (bytes > UNIFORM_BUFFER_SIZE / 4) {
++            porte_cap_valid = false;
++            return false;
++        }
++        auto [ptr, offset, invalidate] = uniform_buffer.Map(bytes, uniform_buffer_alignment);
++        u32 used = 0;
++        for (std::size_t s = 0; s < n; s++) {
++            const int d = cap->slot_draw[s];
++            if (d < 0 || static_cast<std::size_t>(d) >= count || !per_draw[d]) {
++                continue; // keeps its recorded uniforms
++            }
++            const Pica::Uniforms& u = *per_draw[d];
++            Pica::Shader::Generator::VSPicaUniformData data;
++            data.b = 0;
++            for (u32 j = 0; j < u.b.size(); j++) {
++                data.b |= u.b[j] << j;
++            }
++            for (u32 j = 0; j < u.i.size(); j++) {
++                data.i[j] = Common::MakeVec<u32>(u.i[j].x, u.i[j].y, u.i[j].z, u.i[j].w);
++            }
++            for (u32 j = 0; j < u.f.size(); j++) {
++                data.f[j] = Common::MakeVec<f32>(u.f[j].x.ToFloat32(), u.f[j].y.ToFloat32(),
++                                                 u.f[j].z.ToFloat32(), u.f[j].w.ToFloat32());
++            }
++            // (porte) 16:9: the same widening as UploadUniforms (the repeated pictures went out without it: the
++            // picture "fought" between wide and not, the interpolated pictures alternating with the real ones)
++            if (VideoCore::g_porte_wide_proj != 1.0f && s < cap->slot_top.size() && cap->slot_top[s]) {
++                auto& f = data.f;
++                if (f[89][0] == 0.0f && f[89][1] == 0.0f && f[89][2] == -1.0f && f[89][3] == 0.0f) {
++                    for (int k = 0; k < 4; k++) f[87][k] *= VideoCore::g_porte_wide_proj;
++                }
++            }
++            std::memcpy(ptr + used, &data, sizeof(data));
++            (*table)[s] = offset + used;
++            used += uniform_size_aligned_vs_pica;
++        }
++        uniform_buffer.Commit(used);
++    }
++    scheduler.Record([cap, table](vk::CommandBuffer cmdbuf) {
++        g_porte_exec_table = table->data();
++        for (const auto& command : cap->cmds) {
++            command(cmdbuf);
++        }
++        g_porte_exec_table = nullptr;
++    });
++    // what the recorded commands use is in use again now: not reused before the GPU passes this tick
++    StreamBuffer* const rings[4] = {&stream_buffer, &uniform_buffer, &texture_buffer, &texture_lf_buffer};
++    for (std::size_t i = 0; i < 4; i++) {
++        rings[i]->PorteTouch(porte_lo[i], porte_hi[i]);
++    }
++    for (const auto& [pool, index] : cap->sets) {
++        pool->PorteTouch(index);
++    }
++    // surfaces sentenced since the recording began (temporary ones, replaced effect textures) stay alive
++    res_cache.PortePinSince(porte_cap_tick, scheduler.CurrentTick() + 1);
++    scheduler.MakeDirty(StateFlags::Pipeline | StateFlags::DescriptorSets);
++    return true;
++}
++
++// (called from the Ultra Moon frontend without its headers)
++void PorteSetDrawIdx(int index) {
++    g_porte_draw_idx = index;
++}
++void PorteCaptureBegin(VideoCore::RasterizerInterface* r) {
++    if (auto* v = dynamic_cast<RasterizerVulkan*>(r)) {
++        v->PorteCaptureBegin();
++    }
++}
++bool PorteCaptureEnd(VideoCore::RasterizerInterface* r) {
++    auto* v = dynamic_cast<RasterizerVulkan*>(r);
++    return v && v->PorteCaptureEnd();
++}
++bool PorteRepeat(VideoCore::RasterizerInterface* r, const Pica::Uniforms* const* per_draw, std::size_t count) {
++    auto* v = dynamic_cast<RasterizerVulkan*>(r);
++    return v && v->PorteRepeat(per_draw, count);
++}
++
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 0fe71d8..d0df27c 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -10,6 +10,8 @@
+ #include "video_core/renderer_vulkan/vk_render_manager.h"
+ #include "video_core/renderer_vulkan/vk_stream_buffer.h"
+ #include "video_core/renderer_vulkan/vk_texture_runtime.h"
++#include "video_core/renderer_vulkan/porte_repeat.h"
++#include <memory>
+ 
+ namespace Frontend {
+ class EmuWindow;
+@@ -113,6 +115,22 @@ private:
+     /// Creates the vertex layout struct used for software shader pipelines
+     void MakeSoftwareVertexLayout();
+ 
++public:
++    // PORTE (interpolação, "gravar e repetir" - porte_repeat.h): record the first redraw of a sequence, then send
++    // the same commands again with other vertex shader uniforms (one Pica::Uniforms per draw of the list)
++    void PorteCaptureBegin();
++    bool PorteCaptureEnd();
++    bool PorteRepeat(const Pica::Uniforms* const* per_draw, std::size_t count);
++
++private:
++    std::shared_ptr<PorteCapture> porte_cap;
++    bool porte_cap_valid = false;
++    u64 porte_cap_gen = 0;      ///< slots emptied/replaced: must not change from the recording on
++    u64 porte_cap_recycle = 0;  ///< recycled surfaces: must not change after the recording
++    u64 porte_cap_tick = 0;     ///< tick when the recording began (what is sentenced since then is pinned)
++    std::array<u32, 4> porte_lo{}, porte_hi{};
++    std::array<u64, 4> porte_wraps{};
++
+ private:
+     const Instance& instance;
+     Scheduler& scheduler;
+diff --git a/src/video_core/renderer_vulkan/vk_resource_pool.cpp b/src/video_core/renderer_vulkan/vk_resource_pool.cpp
+index 2143471..1bf2b8f 100644
+--- a/src/video_core/renderer_vulkan/vk_resource_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_resource_pool.cpp
+@@ -12,6 +12,8 @@
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/renderer_vulkan/vk_resource_pool.h"
++#include "video_core/renderer_vulkan/porte_repeat.h"
++#include <algorithm>
+ 
+ namespace Vulkan {
+ 
+@@ -178,8 +180,17 @@ void DescriptorHeap::Allocate(std::size_t begin, std::size_t end) {
+     }
+ }
+ 
++void ResourcePool::PorteTouch(std::size_t index) {
++    if (index < ticks.size()) {
++        ticks[index] = std::max(ticks[index], master_semaphore->CurrentTick());
++    }
++}
++
+ vk::DescriptorSet DescriptorHeap::Commit() {
+     const std::size_t index = CommitResource();
++    if (g_porte_capturing) {
++        g_porte_capturing->sets.emplace_back(this, index);
++    }
+     return descriptor_sets[index];
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_resource_pool.h b/src/video_core/renderer_vulkan/vk_resource_pool.h
+index 568b08d..ae5c6f4 100644
+--- a/src/video_core/renderer_vulkan/vk_resource_pool.h
++++ b/src/video_core/renderer_vulkan/vk_resource_pool.h
+@@ -29,6 +29,10 @@ public:
+     ResourcePool& operator=(const ResourcePool&) = default;
+     ResourcePool(const ResourcePool&) = default;
+ 
++public:
++    /// PORTE: resource "index" is used again by commands recorded now (not reused before the current tick)
++    void PorteTouch(std::size_t index);
++
+ protected:
+     std::size_t CommitResource();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index 96fd3bb..619e04c 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -12,6 +12,8 @@
+ #include "common/polyfill_thread.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ #include "video_core/renderer_vulkan/vk_resource_pool.h"
++#include "video_core/renderer_vulkan/porte_repeat.h"
++#include <type_traits>
+ 
+ namespace Vulkan {
+ 
+@@ -50,6 +52,14 @@ public:
+     /// Records the command to the current chunk.
+     template <typename T>
+     void Record(T&& command) {
++        if (g_porte_capturing) [[unlikely]] {
++            using D = std::decay_t<T>;
++            if constexpr (std::is_copy_constructible_v<D>) {
++                g_porte_capturing->cmds.emplace_back(D(command));
++            } else {
++                g_porte_capturing->bad = true;
++            }
++        }
+         if (chunk->Record(command)) {
+             return;
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_stream_buffer.cpp b/src/video_core/renderer_vulkan/vk_stream_buffer.cpp
+index 99daad6..3c0a451 100644
+--- a/src/video_core/renderer_vulkan/vk_stream_buffer.cpp
++++ b/src/video_core/renderer_vulkan/vk_stream_buffer.cpp
+@@ -127,6 +127,7 @@ std::tuple<u8*, u32, bool> StreamBuffer::Map(u32 size, u64 alignment) {
+     if (offset + size > stream_buffer_size) {
+         // The buffer would overflow, save the amount of used watches and reset the state.
+         invalidate = true;
++        ++porte_wraps;
+         invalidation_mark = current_watch_cursor;
+         current_watch_cursor = 0;
+         offset = 0;
+@@ -268,6 +269,24 @@ void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_
+     watches.resize(watches.size() + grow_size);
+ }
+ 
++void StreamBuffer::PorteTouch(u32 lo, u32 hi) {
++    const u64 tick = scheduler.CurrentTick();
++    auto touch = [&](std::vector<Watch>& watches, std::size_t count) {
++        u64 prev = 0;
++        for (std::size_t i = 0; i < count && i < watches.size(); i++) {
++            Watch& w = watches[i];
++            if (w.upper_bound > lo && prev < hi && w.tick < tick) {
++                w.tick = tick;
++            }
++            prev = w.upper_bound;
++        }
++    };
++    touch(current_watches, current_watch_cursor);
++    if (invalidation_mark) {
++        touch(previous_watches, *invalidation_mark);
++    }
++}
++
+ void StreamBuffer::WaitPendingOperations(u64 requested_upper_bound) {
+     if (!invalidation_mark) {
+         return;
+diff --git a/src/video_core/renderer_vulkan/vk_stream_buffer.h b/src/video_core/renderer_vulkan/vk_stream_buffer.h
+index 01747a3..afaaa98 100644
+--- a/src/video_core/renderer_vulkan/vk_stream_buffer.h
++++ b/src/video_core/renderer_vulkan/vk_stream_buffer.h
+@@ -44,6 +44,17 @@ public:
+         return buffer;
+     }
+ 
++    /// PORTE: where the next write goes, and how many times the buffer went back to the start
++    u32 PorteOffset() const noexcept {
++        return offset;
++    }
++    u64 PorteWraps() const noexcept {
++        return porte_wraps;
++    }
++    /// PORTE: the region [lo, hi) is used again by commands recorded now: it is not reused before the GPU
++    /// passes the current tick (raises the tick of the watches over it, in both cycles)
++    void PorteTouch(u32 lo, u32 hi);
++
+ private:
+     struct Watch {
+         u64 tick{};
+@@ -81,6 +92,7 @@ private:
+     std::vector<Watch> previous_watches; ///< Watches used in the previous iteration.
+     std::size_t wait_cursor{};           ///< Last watch being waited for completion.
+     u64 wait_bound{};                    ///< Highest offset being watched for completion.
++    u64 porte_wraps{};                   ///< PORTE: times the buffer went back to the start
+ };
+ 
+ } // namespace Vulkan
+diff --git a/src/video_core/renderer_vulkan/vk_texture_runtime.cpp b/src/video_core/renderer_vulkan/vk_texture_runtime.cpp
+index de747c2..8893eba 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_runtime.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_runtime.cpp
+@@ -297,6 +297,9 @@ TextureRuntime::TextureRuntime(const Instance& instance, Scheduler& scheduler,
+ TextureRuntime::~TextureRuntime() = default;
+ 
+ VideoCore::StagingData TextureRuntime::FindStaging(u32 size, bool upload) {
++    if (g_porte_capturing) {
++        g_porte_capturing->bad = true; // (its data would be gone when the commands are repeated)
++    }
+     StreamBuffer& buffer = upload ? upload_buffer : download_buffer;
+     const auto [data, offset, invalidate] = buffer.Map(size, 16);
+     return VideoCore::StagingData{
