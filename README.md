@@ -26,6 +26,21 @@ move as much as possible out of the emulator, step by step:
 In short: the game logic already runs as native code; the remaining emulator pieces are the hardware and
 operating-system layers around it, and replacing them is the main work ahead. Contributions are welcome.
 
+## Beyond the original hardware
+
+We don't just want to match the 3DS — we plan to add **many features the original hardware never supported**.
+Some are already here:
+
+- **Photo mode** (Game > Photo mode, or F9): the game pauses and the scene is redrawn with a **free camera** —
+  move, turn and zoom anywhere around the frozen moment, hide the interface and take the shot. Impossible on the
+  original console: it is made possible by re-running the game's own draw calls from a new viewpoint.
+- **High frame rate**: in-game frame interpolation up to 240 FPS, while the game logic keeps its original 30 FPS timing.
+- **True widescreen (16:9)** and **higher internal resolutions** instead of the original 400×240.
+- **Achievements**, **save states** and an **advanced log** for bug reports.
+- **Modern controllers** with Xbox / PlayStation button icons shown inside the game's own menus.
+
+More is planned as the port becomes fully native.
+
 ## Features
 
 - Game code recompiled to native from your dump at install time (no JIT; ~98–99% native, interpreter fallback for the rest)
