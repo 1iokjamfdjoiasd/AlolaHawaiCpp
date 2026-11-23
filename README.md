@@ -10,6 +10,10 @@ library, and run inside a modified [Azahar](https://github.com/azahar-emu/azahar
 > You must own the game and dump it yourself from your own console (decrypted `.3ds`).
 > Requests for ROMs, keys or download links will be closed without reply.
 
+> **This is a personal project.** It is developed in my free time, mainly so my friends and I can play.
+> There is no schedule and no guarantee of support: **once I decide it is good enough, updates may stop
+> without notice.** The code stays available under the GPL, so anyone is free to fork it and continue.
+
 ## Goal: a 100% native PC port
 
 The long-term goal is a **complete native PC port that does not depend on an emulator at all**. We are working to
