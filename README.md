@@ -10,9 +10,25 @@ library, and run inside a modified [Azahar](https://github.com/azahar-emu/azahar
 > You must own the game and dump it yourself from your own console (decrypted `.3ds`).
 > Requests for ROMs, keys or download links will be closed without reply.
 
+## Goal: a 100% native PC port
+
+The long-term goal is a **complete native PC port that does not depend on an emulator at all**. We are working to
+move as much as possible out of the emulator, step by step:
+
+| Part | Today | Goal |
+|---|---|---|
+| Game CPU code (ARM11) | ✅ Recompiled to native x86-64 C: ~98–99% of executed code runs natively, the rest falls back to an interpreter | 100% native, no interpreter |
+| Graphics (PICA200 GPU) | Azahar's Vulkan renderer (with our own frame interpolation, 16:9 and presenter) | Direct native renderer driven by the recompiled code |
+| Sound (DSP) | Azahar's DSP emulation | Native audio output |
+| 3DS OS services (files, saves, input, time) | Azahar's high-level emulation (HLE) | Thin native replacements |
+| Frontend (menu, launcher, controls, installer) | ✅ Our own code | — |
+
+In short: the game logic already runs as native code; the remaining emulator pieces are the hardware and
+operating-system layers around it, and replacing them is the main work ahead. Contributions are welcome.
+
 ## Features
 
-- Native code recompiled from your dump at install time (no JIT), interpreter fallback for the rest
+- Game code recompiled to native from your dump at install time (no JIT; ~98–99% native, interpreter fallback for the rest)
 - In-game frame interpolation up to 240 FPS (battles, Z-Moves and cutscenes included)
 - Vulkan renderer, true 16:9 layout, upscaling, FXAA
 - Full in-game menu (Esc / Guide button): graphics, screen layouts, sound, controls, save states, achievements
