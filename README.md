@@ -14,6 +14,10 @@ library, and run inside a modified [Azahar](https://github.com/azahar-emu/azahar
 > There is no schedule and no guarantee of support: **once I decide it is good enough, updates may stop
 > without notice.** The code stays available under the GPL, so anyone is free to fork it and continue.
 
+> **This project was made with AI.** The code, tools and research in this repository were written by an AI
+> (Claude, by Anthropic, through Claude Code), directed and play-tested by me. Expect rough edges, and please
+> report what you find in the issues.
+
 ## Goal: a 100% native PC port
 
 The long-term goal is a **complete native PC port that does not depend on an emulator at all**. We are working to
